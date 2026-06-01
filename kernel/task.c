@@ -83,6 +83,11 @@ task_t* task_create(void (*entry)(void))
     if (!task)
         panic("task_create: OOM allocating task struct");
 
+    // Zero the entire struct so fds[] and all fields start clean.
+    // kmalloc does not guarantee zero-initialisation for reused heap blocks.
+    for (uint32_t i = 0; i < sizeof(task_t); i++)
+        ((uint8_t*)task)[i] = 0;
+
     uint8_t* stack = (uint8_t*)kmalloc(TASK_STACK_SIZE);
     if (!stack)
         panic("task_create: OOM allocating kernel stack");
@@ -127,6 +132,9 @@ task_t* task_create_user(void (*entry)(void))
     task_t* task = (task_t*)kmalloc(sizeof(task_t));
     if (!task)
         panic("task_create_user: OOM allocating task struct");
+
+    for (uint32_t i = 0; i < sizeof(task_t); i++)
+        ((uint8_t*)task)[i] = 0;
 
     // Kernel stack — used whenever this task is in kernel mode (syscalls, IRQs)
     uint8_t* stack = (uint8_t*)kmalloc(TASK_STACK_SIZE);
@@ -243,6 +251,9 @@ task_t* task_create_user_from_elf(elf_load_result_t* elf,
     task_t* task = (task_t*)kmalloc(sizeof(task_t));
     if (!task)
         return NULL;
+
+    for (uint32_t i = 0; i < sizeof(task_t); i++)
+        ((uint8_t*)task)[i] = 0;
 
     uint8_t* stack = (uint8_t*)kmalloc(TASK_STACK_SIZE);
     if (!stack) {
@@ -369,7 +380,9 @@ task_t* task_create_user_from_elf(elf_load_result_t* elf,
 
 void task_free(task_t* task)
 {
-    //klog_info("task_free: tid=%u begin", task->tid);
+    // Close all open file descriptors before tearing down the address space.
+    // Flushes pending writes and frees vfs_file_t heap allocations.
+    vfs_task_close_all(task);
 
     if (task->is_user && task->page_dir_phys) {
         //klog_info("task_free: destroying page dir %x",

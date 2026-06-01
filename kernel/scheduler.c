@@ -390,6 +390,11 @@ int scheduler_need_reschedule(void)
     return need_reschedule;
 }
 
+void scheduler_set_need_reschedule(void)
+{
+    need_reschedule = 1;
+}
+
 uint32_t scheduler_current_page_dir_phys(void)
 {
     return current ? current->page_dir_phys : 0;

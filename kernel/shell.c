@@ -811,12 +811,16 @@ void shell_task(void)
                     exec_argv[exec_argc++] = argv[i];
                 exec_argv[exec_argc] = 0;
 
-                // SYS_EXEC = 9; EBX = path, ECX = argv; returns tid or negative
+                // SYS_EXEC = 9; EBX = path, ECX = argv, EDX = 0 (no redirect)
+                // EDX must be explicitly zeroed — leaving it unspecified lets the
+                // compiler pass whatever garbage was in the register, which
+                // SYS_EXEC interprets as a stdout redirect path and corrupts the
+                // child's fd table, causing a double-free on task teardown.
                 int tid;
                 __asm__ volatile (
                     "int $0x80"
                     : "=a"(tid)
-                    : "a"(9), "b"(path), "c"(exec_argv)
+                    : "a"(9), "b"(path), "c"(exec_argv), "d"(0)
                     : "memory"
                 );
 

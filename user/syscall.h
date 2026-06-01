@@ -114,7 +114,7 @@ static inline int sys_close(int fd)
     return ret;
 }
 
-static inline int sys_seek(int fd, unsigned int offset, int whence)
+static inline int sys_seek(int fd, int offset, int whence)
 {
     int ret;
     __asm__ volatile (

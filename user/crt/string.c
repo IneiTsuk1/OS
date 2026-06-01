@@ -52,6 +52,34 @@ void* memcpy(void* dst, const void* src, size_t n)
     return dst;
 }
 
+/*
+ * memmove — safe copy for overlapping regions.
+ *
+ * If dst < src (or they don't overlap) we copy forward exactly like memcpy.
+ * If dst > src and the regions overlap, copying forward would clobber source
+ * bytes before we read them, so we copy backward instead.
+ */
+void* memmove(void* dst, const void* src, size_t n)
+{
+    unsigned char*       d = (unsigned char*)dst;
+    const unsigned char* s = (const unsigned char*)src;
+
+    if (d == s || n == 0)
+        return dst;
+
+    if (d < s || d >= s + n) {
+        /* No overlap, or dst is entirely before src — forward copy. */
+        while (n--) *d++ = *s++;
+    } else {
+        /* dst overlaps from above — copy backward. */
+        d += n;
+        s += n;
+        while (n--) *--d = *--s;
+    }
+
+    return dst;
+}
+
 void* memset(void* dst, int val, size_t n)
 {
     unsigned char* d = (unsigned char*)dst;

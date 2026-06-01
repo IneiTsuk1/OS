@@ -204,11 +204,15 @@ void syscall_handler(regs_t* r)
             // EBX = ptr to path string (user or kernel space).
             // ECX = ptr to null-terminated char* argv[] array (argv[0] = path).
             //       May be NULL — treated as argc=0.
+            // EDX = ptr to stdout redirect path string, or 0 for no redirect.
+            //       If non-zero, the child's fd 1 (stdout) is replaced with a
+            //       newly created/truncated file at that path before the task runs.
             // Loads and launches an ELF32 executable.
             // Returns the new task's tid in EAX, or negative on error.
-            task_t*  task     = scheduler_current();
-            uint32_t path_ptr = r->ebx;
-            uint32_t argv_ptr = r->ecx;
+            task_t*  task      = scheduler_current();
+            uint32_t path_ptr  = r->ebx;
+            uint32_t argv_ptr  = r->ecx;
+            uint32_t redir_ptr = r->edx;   // stdout redirect path, or 0
 
             // Kernel tasks (e.g. the shell) pass kernel pointers — PAGE_USER
             // is not set on kernel pages so skip user-pointer validation for them.
@@ -258,6 +262,65 @@ void syscall_handler(regs_t* r)
                 r->eax = (uint32_t)-1;
                 break;
             }
+
+            // ---- stdout redirect --------------------------------------------
+            // If a redirect path was supplied, open/create the file and replace
+            // the child's stdout (fd 1) with it.  We do this before
+            // scheduler_add so the task never runs with the wrong stdout.
+            if (redir_ptr) {
+                const char* redir_path = (const char*)redir_ptr;
+
+                // Truncate any existing file by unlinking then creating fresh.
+                vfs_unlink(redir_path);
+                vfs_create(redir_path);
+
+                // Allocate a vfs_file_t directly into the new task's fd 1.
+                // We can't use vfs_open (it operates on scheduler_current's table),
+                // so open in our own table, copy the struct, then close our fd.
+                int rfd = vfs_open(redir_path, O_WRONLY);
+                if (rfd >= 0) {
+                    vfs_file_t* src = vfs_get_fd(rfd);
+                    vfs_file_t* dst = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+                    if (dst && src) {
+                        // Copy the open file state into a fresh allocation.
+                        for (uint32_t b = 0; b < sizeof(vfs_file_t); b++)
+                            ((uint8_t*)dst)[b] = ((uint8_t*)src)[b];
+                        dst->flags = O_WRONLY;
+
+                        // Replace child's stdout — free the terminal pseudo-fd first.
+                        if (new_task->fds[VFS_FD_STDOUT])
+                            kfree(new_task->fds[VFS_FD_STDOUT]);
+                        new_task->fds[VFS_FD_STDOUT] = dst;
+
+                        // Also replace stderr so error output goes to the file.
+                        vfs_file_t* dst2 = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+                        if (dst2) {
+                            for (uint32_t b = 0; b < sizeof(vfs_file_t); b++)
+                                ((uint8_t*)dst2)[b] = ((uint8_t*)src)[b];
+                            dst2->flags = O_WRONLY;
+                            if (new_task->fds[VFS_FD_STDERR])
+                                kfree(new_task->fds[VFS_FD_STDERR]);
+                            new_task->fds[VFS_FD_STDERR] = dst2;
+                        }
+
+                        klog_info("SYS_EXEC: stdout redirected to %s", redir_path);
+                    } else if (dst) {
+                        kfree(dst);
+                    }
+                    // Close our temporary fd — the child has its own copy.
+                    vfs_close(rfd);
+                } else {
+                    klog_warn("SYS_EXEC: redirect open(%s) failed", redir_path);
+                }
+            }
+
+            // Pre-register the calling task as the waiter BEFORE scheduler_add.
+            // This closes the race where the child runs to completion between
+            // scheduler_add() returning and SYS_WAITPID being called: if the
+            // child exits before SYS_WAITPID, scheduler_exit() finds waiter set
+            // and wakes us; scheduler_wait() then finds target==NULL and returns
+            // immediately since we are already TASK_READY.
+            new_task->waiter = scheduler_current();
 
             scheduler_add(new_task);
             klog_info("SYS_EXEC: launched tid=%u entry=%x argc=%d",

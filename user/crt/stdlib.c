@@ -8,35 +8,67 @@
  * kernel maps at load time.  64 KiB is enough for typical user programs; the
  * ceiling can be raised by changing HEAP_SIZE.
  *
- * Block header layout (8 bytes):
+ * Block header layout (16 bytes):
+ *   uint32_t magic  — 0xCAFEF00D = free, 0xDEADBEEF = used  (corruption guard)
  *   uint32_t size   — usable bytes after this header
  *   uint32_t free   — 1 = free, 0 = used
+ *   uint32_t _pad   — reserved, keeps header 16-byte aligned
  *
- * Blocks are always 8-byte aligned.  Forward coalescing on free.
- * No backward coalescing (keeps the implementation small).
+ * Blocks are always 8-byte aligned.
+ * Forward + backward coalescing on free.
  */
 
-#define HEAP_SIZE   (64 * 1024)   /* 64 KiB static arena */
-#define HDR_SIZE    8             /* size of block_hdr_t */
-#define MIN_SPLIT   16            /* don't split if remainder < this */
-#define ALIGN8(n)   (((n) + 7) & ~7u)
+#define HEAP_SIZE   (64 * 1024)     /* 64 KiB static arena              */
+#define HDR_SIZE    ((uint32_t)sizeof(block_hdr_t))
+#define MIN_SPLIT   16              /* don't split if remainder < this   */
+#define ALIGN8(n)   (((n) + 7u) & ~7u)
+
+#define MAGIC_FREE  0xCAFEF00Du
+#define MAGIC_USED  0xDEADBEEFu
 
 typedef struct block_hdr {
+    uint32_t magic;
     uint32_t size;
     uint32_t free;
+    uint32_t _pad;
 } block_hdr_t;
 
 /* The arena lives in .bss — zero-initialised by the ELF loader. */
 static unsigned char heap_arena[HEAP_SIZE];
 static int heap_ready = 0;
 
+/* ---- internal helpers ---------------------------------------------------- */
+
+static inline block_hdr_t* hdr_of(void* ptr)
+{
+    return (block_hdr_t*)((unsigned char*)ptr - HDR_SIZE);
+}
+
+static inline int in_arena(block_hdr_t* blk)
+{
+    return (unsigned char*)blk >= heap_arena &&
+           (unsigned char*)blk <  heap_arena + HEAP_SIZE;
+}
+
+/* Walk forward to the next block header (or one-past-end of arena). */
+static inline block_hdr_t* next_blk(block_hdr_t* blk)
+{
+    return (block_hdr_t*)((unsigned char*)blk + HDR_SIZE + blk->size);
+}
+
+/* ---- heap init ----------------------------------------------------------- */
+
 static void heap_init(void)
 {
     block_hdr_t* hdr = (block_hdr_t*)heap_arena;
-    hdr->size = HEAP_SIZE - HDR_SIZE;
-    hdr->free = 1;
+    hdr->magic = MAGIC_FREE;
+    hdr->size  = HEAP_SIZE - HDR_SIZE;
+    hdr->free  = 1;
+    hdr->_pad  = 0;
     heap_ready = 1;
 }
+
+/* ---- malloc -------------------------------------------------------------- */
 
 void* malloc(size_t size)
 {
@@ -47,44 +79,85 @@ void* malloc(size_t size)
 
     block_hdr_t* blk = (block_hdr_t*)heap_arena;
 
-    while ((unsigned char*)blk < heap_arena + HEAP_SIZE) {
+    while (in_arena(blk)) {
         if (blk->free && blk->size >= size) {
             /* Split if the remainder is large enough to be useful. */
             if (blk->size >= size + HDR_SIZE + MIN_SPLIT) {
-                block_hdr_t* next = (block_hdr_t*)((unsigned char*)blk + HDR_SIZE + size);
-                next->size = blk->size - size - HDR_SIZE;
-                next->free = 1;
-                blk->size  = size;
+                block_hdr_t* split = (block_hdr_t*)((unsigned char*)blk + HDR_SIZE + size);
+                split->magic = MAGIC_FREE;
+                split->size  = blk->size - size - HDR_SIZE;
+                split->free  = 1;
+                split->_pad  = 0;
+                blk->size    = size;
             }
-            blk->free = 0;
+            blk->magic = MAGIC_USED;
+            blk->free  = 0;
             return (unsigned char*)blk + HDR_SIZE;
         }
-        blk = (block_hdr_t*)((unsigned char*)blk + HDR_SIZE + blk->size);
+        blk = next_blk(blk);
     }
 
     return 0;  /* out of memory */
 }
 
+/* ---- calloc -------------------------------------------------------------- */
+
 void* calloc(size_t nmemb, size_t size)
 {
+    /* Overflow check: nmemb * size must not wrap. */
+    if (size && nmemb > (size_t)-1 / size)
+        return 0;
+
     size_t total = nmemb * size;
     void* ptr = malloc(total);
     if (ptr) memset(ptr, 0, total);
     return ptr;
 }
 
+/* ---- free ---------------------------------------------------------------- */
+
 void free(void* ptr)
 {
     if (!ptr) return;
 
-    block_hdr_t* blk = (block_hdr_t*)((unsigned char*)ptr - HDR_SIZE);
-    blk->free = 1;
+    block_hdr_t* blk = hdr_of(ptr);
 
-    /* Forward coalesce: merge with the immediately following free block. */
-    block_hdr_t* next = (block_hdr_t*)((unsigned char*)blk + HDR_SIZE + blk->size);
-    while ((unsigned char*)next < heap_arena + HEAP_SIZE && next->free) {
-        blk->size += HDR_SIZE + next->size;
-        next = (block_hdr_t*)((unsigned char*)blk + HDR_SIZE + blk->size);
+    /* Bounds check — catch wild pointers. */
+    if (!in_arena(blk))
+        return;  /* silently ignore out-of-arena pointers */
+
+    /* Magic check — detect double-free and heap corruption. */
+    if (blk->magic == MAGIC_FREE)
+        return;  /* double-free: already freed, ignore */
+    if (blk->magic != MAGIC_USED)
+        return;  /* corrupted header, ignore */
+
+    blk->magic = MAGIC_FREE;
+    blk->free  = 1;
+
+    /* --- Forward coalesce: merge with all immediately following free blocks. */
+    block_hdr_t* nxt = next_blk(blk);
+    while (in_arena(nxt) && nxt->free && nxt->magic == MAGIC_FREE) {
+        blk->size += HDR_SIZE + nxt->size;
+        nxt = next_blk(blk);
+    }
+
+    /* --- Backward coalesce: walk from the arena start to find our predecessor.
+     *
+     * We have no prev pointer in the header (keeping the struct small), so we
+     * do a linear walk.  This is O(n) in the number of blocks, but free() is
+     * not called in hot loops in typical user programs and the arena is small
+     * (64 KiB → at most ~4096 8-byte minimum blocks).
+     */
+    block_hdr_t* prev = 0;
+    block_hdr_t* cur  = (block_hdr_t*)heap_arena;
+    while (in_arena(cur) && cur != blk) {
+        prev = cur;
+        cur  = next_blk(cur);
+    }
+    if (prev && prev->free && prev->magic == MAGIC_FREE) {
+        prev->size += HDR_SIZE + blk->size;
+        /* blk is now absorbed into prev — nothing else to do. */
     }
 }
 
@@ -94,8 +167,8 @@ int atoi(const char* s)
 {
     int n = 0, neg = 0;
     while (*s == ' ') s++;
-    if (*s == '-') { neg = 1; s++; }
-    else if (*s == '+') s++;
+    if      (*s == '-') { neg = 1; s++; }
+    else if (*s == '+') { s++; }
     while (*s >= '0' && *s <= '9') n = n * 10 + (*s++ - '0');
     return neg ? -n : n;
 }

@@ -9,6 +9,7 @@ void     scheduler_tick(void);
 void     scheduler_yield(void);
 void     scheduler_sleep(uint32_t wake_tick);
 void     scheduler_wait(uint32_t tid); // block until task tid exits (or already gone)
+void     scheduler_set_need_reschedule(void); // force reschedule on next IRQ exit
 task_t*  scheduler_current(void);
 
 // Returns the physical address of the current task's page directory.

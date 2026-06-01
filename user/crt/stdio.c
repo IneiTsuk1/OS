@@ -4,7 +4,6 @@
 
 /* ---- low-level write ------------------------------------------------------ */
 
-/* Write len bytes from buf to fd via SYS_FWRITE. */
 static int fd_write(int fd, const char* buf, int len)
 {
     if (len <= 0) return 0;
@@ -28,57 +27,83 @@ int puts(const char* s)
     return n + 1;
 }
 
-/* ---- vsprintf ------------------------------------------------------------- */
+/* ---- vsnprintf ------------------------------------------------------------ */
 /*
- * Formats into a caller-supplied buffer.  Never writes more than the buffer
- * can hold — the caller must provide a large enough buffer (no bounds checking
- * here; this is a freestanding CRT with no dynamic allocation in the formatter).
+ * Core formatter.  Writes at most (size-1) characters into buf, always
+ * null-terminates (if size > 0), and returns the number of characters that
+ * would have been written had the buffer been large enough (excluding the
+ * null terminator) — matching the C99 snprintf contract.
  *
  * Supported conversions:
  *   %c   — single character
  *   %s   — null-terminated string (NULL → "(null)")
  *   %d   — signed 32-bit decimal
  *   %u   — unsigned 32-bit decimal
- *   %x   — unsigned 32-bit lowercase hex (no "0x" prefix)
- *   %X   — unsigned 32-bit uppercase hex (no "0X" prefix)
- *   %p   — pointer as 0x%08X
+ *   %x   — unsigned 32-bit lowercase hex
+ *   %X   — unsigned 32-bit uppercase hex
+ *   %p   — pointer as 0x%08x
  *   %%   — literal '%'
  *
- * Width and precision are not supported — use %s with pre-formatted strings
- * via itoa if alignment is needed.
+ * Width field (decimal digits only, no '*') is supported for all conversions.
+ * Padding is space-padded and left-aligned (no '-' flag yet).
  */
-int vsprintf(char* buf, const char* fmt, va_list args)
+int vsnprintf(char* buf, size_t size, const char* fmt, va_list args)
 {
-    char* out = buf;
+    /* We write to a shadow pointer so we can count bytes past the buffer end. */
+    char*  out   = buf;
+    size_t left  = (size > 0) ? size - 1 : 0;  /* bytes left excl. terminator */
+    int    total = 0;                            /* total chars produced        */
+
+#define EMIT(c) do {                    \
+    if (left > 0) { *out++ = (c); left--; } \
+    total++;                            \
+} while (0)
 
     while (*fmt) {
         if (*fmt != '%') {
-            *out++ = *fmt++;
+            EMIT(*fmt++);
             continue;
         }
         fmt++;  /* skip '%' */
 
+        /* Optional width field */
+        int width = 0;
+        while (*fmt >= '0' && *fmt <= '9')
+            width = width * 10 + (*fmt++ - '0');
+
         switch (*fmt++) {
             case 'c': {
-                *out++ = (char)va_arg(args, int);
+                int pad = width > 1 ? width - 1 : 0;
+                while (pad--) EMIT(' ');
+                EMIT((char)va_arg(args, int));
                 break;
             }
             case 's': {
                 const char* s = va_arg(args, const char*);
                 if (!s) s = "(null)";
-                while (*s) *out++ = *s++;
+                int slen = 0;
+                const char* t = s;
+                while (*t++) slen++;
+                int pad = width > slen ? width - slen : 0;
+                while (pad--) EMIT(' ');
+                while (*s) EMIT(*s++);
                 break;
             }
             case 'd': {
-                int n = va_arg(args, int);
-                if (n < 0) { *out++ = '-'; n = -n; }
+                int n   = va_arg(args, int);
+                int neg = (n < 0);
+                if (neg) n = -n;
                 char tmp[12]; int i = 0;
                 if (n == 0) { tmp[i++] = '0'; }
                 else {
                     unsigned int un = (unsigned int)n;
                     while (un) { tmp[i++] = '0' + un % 10; un /= 10; }
                 }
-                while (i--) *out++ = tmp[i];
+                int total_chars = neg + i;
+                int pad = width > total_chars ? width - total_chars : 0;
+                while (pad--) EMIT(' ');
+                if (neg) EMIT('-');
+                while (i--) EMIT(tmp[i]);
                 break;
             }
             case 'u': {
@@ -86,7 +111,9 @@ int vsprintf(char* buf, const char* fmt, va_list args)
                 char tmp[12]; int i = 0;
                 if (n == 0) { tmp[i++] = '0'; }
                 else { while (n) { tmp[i++] = '0' + n % 10; n /= 10; } }
-                while (i--) *out++ = tmp[i];
+                int pad = width > i ? width - i : 0;
+                while (pad--) EMIT(' ');
+                while (i--) EMIT(tmp[i]);
                 break;
             }
             case 'x': {
@@ -95,7 +122,9 @@ int vsprintf(char* buf, const char* fmt, va_list args)
                 char tmp[9]; int i = 0;
                 if (n == 0) { tmp[i++] = '0'; }
                 else { while (n) { tmp[i++] = hex[n & 0xF]; n >>= 4; } }
-                while (i--) *out++ = tmp[i];
+                int pad = width > i ? width - i : 0;
+                while (pad--) EMIT(' ');
+                while (i--) EMIT(tmp[i]);
                 break;
             }
             case 'X': {
@@ -104,56 +133,87 @@ int vsprintf(char* buf, const char* fmt, va_list args)
                 char tmp[9]; int i = 0;
                 if (n == 0) { tmp[i++] = '0'; }
                 else { while (n) { tmp[i++] = hex[n & 0xF]; n >>= 4; } }
-                while (i--) *out++ = tmp[i];
+                int pad = width > i ? width - i : 0;
+                while (pad--) EMIT(' ');
+                while (i--) EMIT(tmp[i]);
                 break;
             }
             case 'p': {
-                /* Pointer: 0x followed by 8 hex digits */
                 unsigned int n = (unsigned int)(uintptr_t)va_arg(args, void*);
                 const char* hex = "0123456789abcdef";
-                *out++ = '0'; *out++ = 'x';
+                EMIT('0'); EMIT('x');
                 for (int shift = 28; shift >= 0; shift -= 4)
-                    *out++ = hex[(n >> shift) & 0xF];
+                    EMIT(hex[(n >> shift) & 0xF]);
                 break;
             }
             case '%': {
-                *out++ = '%';
+                EMIT('%');
                 break;
             }
             default: {
-                /* Unknown specifier — emit literally */
-                *out++ = '%';
-                *out++ = *(fmt - 1);
+                EMIT('%');
+                EMIT(*(fmt - 1));
                 break;
             }
         }
     }
 
-    *out = '\0';
-    return (int)(out - buf);
+#undef EMIT
+
+    if (size > 0) *out = '\0';
+    return total;
+}
+
+/* ---- vsprintf (legacy, no bounds checking) -------------------------------- */
+/*
+ * Kept for source compatibility.  Prefer vsnprintf in new code.
+ * Passes INT_MAX as the size limit — the caller is responsible for providing
+ * a buffer large enough for the formatted output.
+ */
+int vsprintf(char* buf, const char* fmt, va_list args)
+{
+    return vsnprintf(buf, (size_t)-1, fmt, args);
+}
+
+/* ---- snprintf / sprintf --------------------------------------------------- */
+
+int snprintf(char* buf, size_t size, const char* fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf, size, fmt, args);
+    va_end(args);
+    return n;
 }
 
 int sprintf(char* buf, const char* fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
-    int n = vsprintf(buf, fmt, args);
+    int n = vsnprintf(buf, (size_t)-1, fmt, args);
     va_end(args);
     return n;
 }
 
 /* ---- vfprintf ------------------------------------------------------------- */
 /*
- * Formats into a stack buffer and writes to fd in one syscall.
- * 1 KiB buffer is enough for a single printf line in practice.
- * For very long output, call printf multiple times.
+ * Formats into a stack buffer and writes to fd.
+ *
+ * The buffer is 2 KiB.  vsnprintf will never overflow it — it truncates at
+ * (size - 1) bytes and returns the number of bytes the full output would have
+ * needed, so callers can detect truncation if they care.
  */
+#define FPRINTF_BUFSZ 2048
+
 int vfprintf(int fd, const char* fmt, va_list args)
 {
-    char buf[1024];
-    int n = vsprintf(buf, fmt, args);
-    if (n > 0)
-        fd_write(fd, buf, n);
+    char buf[FPRINTF_BUFSZ];
+    int n = vsnprintf(buf, sizeof(buf), fmt, args);
+    /* n is the number of chars the format would produce if buf were infinite.
+     * We write min(n, FPRINTF_BUFSZ-1) bytes — the null terminator is not sent. */
+    int to_write = n < FPRINTF_BUFSZ ? n : FPRINTF_BUFSZ - 1;
+    if (to_write > 0)
+        fd_write(fd, buf, to_write);
     return n;
 }
 

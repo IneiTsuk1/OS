@@ -6,8 +6,14 @@ LD      = ld
 GCC_INC := $(shell $(CC) -m32 -print-file-name=include)
 
 CFLAGS  = -m32 -ffreestanding -nostdlib -nostdinc -Wall -Wextra \
+          -fno-pic -fno-pie \
           -I. -Icrt -I$(GCC_INC)
-LDFLAGS = -m elf_i386 -T user.ld --nmagic
+
+# --nmagic removed: it disabled page alignment of sections, overriding the
+# ALIGN(4096) directives in user.ld and collapsing all sections into a single
+# RWX LOAD segment.  Without --nmagic the linker respects the script and
+# produces separate R-X / R-- / RW- segments with correct permissions.
+LDFLAGS = -m elf_i386 -T user.ld
 
 CRT_LIB = crt/crt.a
 CRT_OBJ = crt/string.o crt/stdlib.o crt/stdio.o

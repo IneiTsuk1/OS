@@ -1,7 +1,6 @@
 #include "keyboard.h"
 #include "../../kernel/irq.h"
 #include "../../kernel/klog.h"
-#include "../../kernel/scheduler.h"
 #include <stdint.h>
 
 // ---- I/O port ---------------------------------------------------------------
@@ -244,8 +243,13 @@ uint32_t keyboard_read(char* buf, uint32_t len)
     uint32_t n = 0;
 
     while (n < len) {
+        // Spin via hlt — safe to call from any context including mid-syscall
+        // (isr_common re-enables interrupts with sti before calling vfs_read).
+        // scheduler_yield() must NOT be used here: it invokes switch_to() which
+        // saves/restores the full register frame, corrupting the live isr_common
+        // frame on the kernel stack and producing random #PF / #DE panics.
         while (kb_tail == kb_head)
-            scheduler_yield();
+            __asm__ volatile ("hlt");
 
         uint8_t c = kb_buffer[kb_tail];
         kb_tail = (kb_tail + 1) % KB_BUFFER_SIZE;
@@ -262,8 +266,6 @@ uint32_t keyboard_read(char* buf, uint32_t len)
         if (c == '\n')
             break;
     }
-
-    return n;
 
     return n;
 }

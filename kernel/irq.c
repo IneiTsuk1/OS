@@ -2,6 +2,8 @@
 #include "idt.h"
 #include "pic.h"
 #include "klog.h"
+#include "scheduler.h"
+#include "task.h"
 #include <stddef.h>
 
 // Forward declarations for stubs in isr_stub.asm
@@ -71,4 +73,14 @@ void irq_handler(regs_t* r)
         klog_warn("IRQ%u: no handler registered", irq);
 
     pic_eoi(irq);
+
+    // If the interrupted task is blocked (e.g. scheduler_wait's hlt loop),
+    // trigger an immediate reschedule so the CPU is handed to a runnable task
+    // without waiting for the next PIT timeslice.  Without this, a keyboard IRQ
+    // wakes the blocked task's hlt, irq_stub sees need_reschedule==0, and irets
+    // back to the blocked task — leaving a ready consumer starved until the next
+    // PIT tick fires 20ms later.
+    task_t* cur = scheduler_current();
+    if (cur && cur->state == TASK_BLOCKED)
+        scheduler_set_need_reschedule();
 }
