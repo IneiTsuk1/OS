@@ -1,0 +1,15 @@
+#pragma once
+#include <stdint.h>
+
+typedef struct regs
+{
+    uint32_t ds;
+    uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax;
+    uint32_t int_no;
+    uint32_t err_code;
+    uint32_t eip, cs, eflags, useresp, ss;
+} regs_t;
+
+void isr_handler(regs_t* r);
+void isr_install(void);
+extern void isr128(void);   // syscall gate stub
