@@ -18,7 +18,7 @@ typedef struct block_header {
     uint32_t             size;  // usable bytes after this header
     uint32_t             free;  // 1 = free, 0 = used
     struct block_header* next;  // next block (NULL = last)
-    struct block_header* prev;  // previous block (NULL = first) — for backward coalesce
+    struct block_header* prev;  // previous block (NULL = first)
 } block_header_t;
 
 static block_header_t* heap_head = NULL;
@@ -50,6 +50,29 @@ static int heap_grow(uint32_t bytes)
     return 0;
 }
 
+// Split `blk` so that its usable region is exactly `size` bytes, creating a
+// new free block from the remainder if the remainder is large enough.
+// Must be called with heap_lock held and blk->free == 0.
+static void maybe_split(block_header_t* blk, size_t size)
+{
+    if (blk->size < size + sizeof(block_header_t) + MIN_SPLIT)
+        return;
+
+    block_header_t* split = (block_header_t*)
+        ((uint8_t*)blk + sizeof(block_header_t) + size);
+
+    split->size = blk->size - size - sizeof(block_header_t);
+    split->free = 1;
+    split->next = blk->next;
+    split->prev = blk;
+
+    if (split->next)
+        split->next->prev = split;
+
+    blk->size = size;
+    blk->next = split;
+}
+
 // ---- public API ------------------------------------------------------------
 
 void kheap_init(void)
@@ -74,8 +97,7 @@ void* kmalloc(size_t size)
     if (size == 0)
         return NULL;
 
-    // Align size to 8 bytes
-    size = (size + 7) & ~7u;
+    size = (size + 7) & ~7u;  // align to 8 bytes
 
     spinlock_acquire(&heap_lock);
 
@@ -83,29 +105,12 @@ void* kmalloc(size_t size)
 
     while (blk) {
         if (blk->free && blk->size >= size) {
-            // Split if the remainder is large enough to be useful
-            if (blk->size >= size + sizeof(block_header_t) + MIN_SPLIT) {
-                block_header_t* split = (block_header_t*)
-                    ((uint8_t*)blk + sizeof(block_header_t) + size);
-
-                split->size = blk->size - size - sizeof(block_header_t);
-                split->free = 1;
-                split->next = blk->next;
-                split->prev = blk;
-
-                if (split->next)
-                    split->next->prev = split;
-
-                blk->size = size;
-                blk->next = split;
-            }
-
+            maybe_split(blk, size);
             blk->free = 0;
             spinlock_release(&heap_lock);
             return (void*)((uint8_t*)blk + sizeof(block_header_t));
         }
 
-        // Reached the last block without finding a fit — grow the heap
         if (!blk->next) {
             uint32_t needed = sizeof(block_header_t) + size;
             if (heap_grow(needed) != 0) {
@@ -113,17 +118,10 @@ void* kmalloc(size_t size)
                 return NULL;
             }
 
-            // The new pages start immediately after the current last block's
-            // usable region.
             block_header_t* newblk = (block_header_t*)
                 ((uint8_t*)blk + sizeof(block_header_t) + blk->size);
 
             if (blk->free) {
-                // newblk points to the byte immediately after blk's usable
-                // region (== old heap_top before heap_grow ran).
-                // heap_top has already been advanced by heap_grow, so
-                // (heap_top - newblk) is exactly the number of new bytes
-                // added, which we absorb into the existing free tail block.
                 blk->size += heap_top - (uint32_t)newblk;
             } else {
                 newblk->size = heap_top
@@ -134,14 +132,12 @@ void* kmalloc(size_t size)
                 newblk->prev = blk;
                 blk->next    = newblk;
             }
-            // Retry from this block (either extended blk or new newblk)
             continue;
         }
 
         blk = blk->next;
     }
 
-    // Should be unreachable, but be safe
     spinlock_release(&heap_lock);
     return NULL;
 }
@@ -161,7 +157,7 @@ void kfree(void* ptr)
 
     blk->free = 1;
 
-    // Coalesce forward: merge with next block if it is free
+    // Coalesce forward
     if (blk->next && blk->next->free) {
         block_header_t* next = blk->next;
         blk->size += sizeof(block_header_t) + next->size;
@@ -170,7 +166,7 @@ void kfree(void* ptr)
             blk->next->prev = blk;
     }
 
-    // Coalesce backward: merge into previous block if it is free
+    // Coalesce backward
     if (blk->prev && blk->prev->free) {
         block_header_t* prev = blk->prev;
         prev->size += sizeof(block_header_t) + blk->size;
@@ -182,11 +178,77 @@ void kfree(void* ptr)
     spinlock_release(&heap_lock);
 }
 
+void* krealloc(void* ptr, size_t new_size)
+{
+    // krealloc(NULL, size) == kmalloc(size)
+    if (!ptr)
+        return kmalloc(new_size);
+
+    // krealloc(ptr, 0) == kfree(ptr)
+    if (new_size == 0) {
+        kfree(ptr);
+        return NULL;
+    }
+
+    new_size = (new_size + 7) & ~7u;  // align to 8 bytes
+
+    block_header_t* blk = (block_header_t*)
+        ((uint8_t*)ptr - sizeof(block_header_t));
+
+    spinlock_acquire(&heap_lock);
+
+    if (blk->free)
+        panic("krealloc: called on free block at %x", ptr);
+
+    // Case 1: block is already large enough — split off excess and return.
+    if (blk->size >= new_size) {
+        maybe_split(blk, new_size);
+        spinlock_release(&heap_lock);
+        return ptr;
+    }
+
+    // Case 2: next block is free and combined size is sufficient — absorb it
+    // in-place, no copy needed.
+    if (blk->next && blk->next->free) {
+        uint32_t combined = blk->size
+                          + sizeof(block_header_t)
+                          + blk->next->size;
+
+        if (combined >= new_size) {
+            block_header_t* next = blk->next;
+            blk->size = combined;
+            blk->next = next->next;
+            if (blk->next)
+                blk->next->prev = blk;
+
+            maybe_split(blk, new_size);
+            spinlock_release(&heap_lock);
+            return ptr;
+        }
+    }
+
+    // Case 3: need a new allocation — alloc, copy, free.
+    // Release the lock before calling kmalloc (which acquires it internally).
+    uint32_t old_size = blk->size;
+    spinlock_release(&heap_lock);
+
+    void* new_ptr = kmalloc(new_size);
+    if (!new_ptr)
+        return NULL;  // original block unchanged
+
+    // Copy old contents
+    uint8_t* src = (uint8_t*)ptr;
+    uint8_t* dst = (uint8_t*)new_ptr;
+    uint32_t copy_len = old_size < new_size ? old_size : new_size;
+    for (uint32_t i = 0; i < copy_len; i++)
+        dst[i] = src[i];
+
+    kfree(ptr);
+    return new_ptr;
+}
+
 void kheap_dump(void)
 {
-    // Snapshot the heap under the lock so we never call klog_info (which
-    // does terminal/serial I/O) while holding the spinlock — that would
-    // deadlock if an IRQ fires and tries to allocate during the log call.
 #define KHEAP_DUMP_MAX 256
     struct { uint32_t addr; uint32_t size; uint32_t is_free; } snap[KHEAP_DUMP_MAX];
     uint32_t nblocks = 0, used = 0, free_bytes = 0;
@@ -204,7 +266,6 @@ void kheap_dump(void)
     }
     spinlock_release(&heap_lock);
 
-    // Log entirely outside the lock.
     klog_info("Heap dump:");
     for (uint32_t i = 0; i < nblocks; i++) {
         klog_info("  [%u] addr=%x size=%u %s",

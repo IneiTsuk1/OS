@@ -54,6 +54,8 @@ static int term_readdir(vfs_file_t* dir, uint32_t index, vfs_dirent_t* out)
 static int term_mkdir(const char* path)   { (void)path; return VFS_EGENERIC; }
 static int term_rmdir(const char* path)   { (void)path; return VFS_EGENERIC; }
 static int term_create(const char* path)  { (void)path; return VFS_EGENERIC; }
+static int term_rename(const char* src, const char* dst)
+    { (void)src; (void)dst; return VFS_EGENERIC; }
 
 static vfs_ops_t terminal_ops = {
     .open    = term_open,
@@ -65,6 +67,7 @@ static vfs_ops_t terminal_ops = {
     .mkdir   = term_mkdir,
     .rmdir   = term_rmdir,
     .create  = term_create,
+    .rename  = term_rename,
 };
 
 // ---- VFS init / mount ------------------------------------------------------
@@ -87,7 +90,8 @@ int vfs_mount(vfs_ops_t* ops)
 
     if (!ops->open   || !ops->read  || !ops->write ||
         !ops->close  || !ops->unlink|| !ops->readdir||
-        !ops->mkdir  || !ops->rmdir || !ops->create) {
+        !ops->mkdir  || !ops->rmdir || !ops->create ||
+        !ops->rename) {
         klog_warn("VFS: mount failed — incomplete ops vtable");
         return VFS_EGENERIC;
     }
@@ -161,6 +165,22 @@ int vfs_alloc_fd(vfs_file_t** out)
                 return VFS_EBADF;
             task->fds[i] = f;
             *out = f;
+            return i;
+        }
+    }
+
+    return VFS_EBADF;  // fd table full
+}
+
+int vfs_alloc_fd_for(task_t* task, vfs_file_t* file)
+{
+    if (!task || !file)
+        return VFS_EBADF;
+
+    // Start from 3 — fds 0/1/2 are reserved for stdio.
+    for (int i = 3; i < VFS_MAX_FDS; i++) {
+        if (!task->fds[i]) {
+            task->fds[i] = file;
             return i;
         }
     }
@@ -348,4 +368,10 @@ int vfs_unlink(const char* path)
 {
     if (!mounted_fs) return VFS_EGENERIC;
     return mounted_fs->unlink(path);
+}
+
+int vfs_rename(const char* src, const char* dst)
+{
+    if (!mounted_fs) return VFS_EGENERIC;
+    return mounted_fs->rename(src, dst);
 }

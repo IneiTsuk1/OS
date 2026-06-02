@@ -15,6 +15,13 @@
                           //   returns 0 or negative error
 #define SYS_EXEC     9    // EBX = ptr to path, ECX = argv[]; returns new tid or negative error
 #define SYS_WAITPID  10   // EBX = tid; blocks until that task exits; returns 0
+#define SYS_PIPE     11   // ECX = ptr to int[2] -> [read_fd, write_fd]; returns 0 or negative
+#define SYS_DUP2     12   // EBX = oldfd, ECX = newfd; returns newfd or negative
+#define SYS_EXECP    13   // EBX = path, ECX = argv[], EDX = stdout_fd (-1=none), ESI = stdin_fd (-1=none)
+                          //   Like SYS_EXEC but wires caller's pipe fds into child stdin/stdout.
+                          //   Caller must close its own pipe ends after this returns.
+                          //   Returns new tid or negative error.
+#define SYS_KILL     14   // EBX = tid, ECX = signal (9 = SIGKILL); returns 0 or -ESRCH
 #define SYS_EXIT     60   // EBX = exit code; does not return
 
 // Stat result written into user space by SYS_STAT.

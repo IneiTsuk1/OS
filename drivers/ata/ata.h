@@ -2,10 +2,12 @@
 #include <stdint.h>
 
 // ---------------------------------------------------------------------------
-// ATA PIO driver
+// ATA PIO driver — IRQ-driven
 //
 // Supports both primary and secondary channels, master and slave per channel
-// (4 drives total).  All I/O is synchronous PIO — no DMA, no interrupts.
+// (4 drives total).  I/O is PIO (no DMA) but interrupt-driven: the CPU halts
+// between issuing a command and the drive asserting IRQ14/IRQ15, allowing
+// other tasks to run.  The public read/write API is unchanged.
 //
 // Drive addressing:
 //   ATA_PRIMARY_MASTER   = 0

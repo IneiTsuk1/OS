@@ -203,7 +203,7 @@ int sprintf(char* buf, const char* fmt, ...)
  * (size - 1) bytes and returns the number of bytes the full output would have
  * needed, so callers can detect truncation if they care.
  */
-#define FPRINTF_BUFSZ 2048
+#define FPRINTF_BUFSZ 256
 
 int vfprintf(int fd, const char* fmt, va_list args)
 {

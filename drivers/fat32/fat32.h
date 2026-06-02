@@ -10,10 +10,10 @@
 //
 // Limitations (M7):
 //   - Single volume, single partition (reads partition 0 from MBR)
-//   - 8.3 filenames only (long filename entries are skipped)
+//   - 8.3 filenames only for create/open; long filenames are read-only
 //   - No file locking
-//   - write() does not support extending a file beyond its current allocation
-//     (growing the FAT chain for appending is supported via O_APPEND/O_CREAT)
+//   - Sector size must be 512 bytes
+//   - Cluster size must not exceed 4096 bytes (8 sectors)
 // ---------------------------------------------------------------------------
 
 // Initialise the FAT32 driver on `drive_index` (ATA drive 0-3).

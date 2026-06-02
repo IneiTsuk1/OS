@@ -68,24 +68,21 @@ void kernel_main(uint32_t mb2_info)
     ata_init();
     klog_info("ATA driver initialized.");
 
-    // Attempt to mount FAT32 on primary master (drive 0).
-    // On QEMU, attach a disk image with: -drive file=disk.img,format=raw
-    static vfs_ops_t fat32_ops;
     vfs_init();
+    klog_info("VFS initialized.");
+
+    static vfs_ops_t fat32_ops;
     if (fat32_init(ATA_PRIMARY_MASTER, &fat32_ops) == 0) {
         if (vfs_mount(&fat32_ops) == 0)
             klog_info("VFS: FAT32 mounted on drive 0.");
         else
             klog_warn("VFS: mount failed.");
     } else {
-        klog_warn("VFS: no FAT32 volume found on drive 0: - filesystem unavailable.");
+        klog_warn("VFS: no FAT32 volume found on drive 0.");
     }
 
-    // Scheduler must be initialised before sti so that the first PIT tick
-    // doesn't call scheduler_tick() with current == NULL.
     scheduler_init();
     klog_info("Scheduler initialized.");
-
     task_t* tsh = task_create(shell_task);
     scheduler_add(tsh);
     klog_info("Shell task created.");
@@ -99,7 +96,6 @@ void kernel_main(uint32_t mb2_info)
 #endif
 
     klog_info("Kernel booted successfully. Entering idle loop.");
-
     __asm__ volatile ("sti");
     while (1) {
         __asm__ volatile ("hlt");

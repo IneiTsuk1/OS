@@ -20,6 +20,11 @@
 #define SYS_STAT     8
 #define SYS_EXEC     9
 #define SYS_WAITPID  10
+#define SYS_PIPE     11   // ECX = ptr to int[2] -> [read_fd, write_fd]; returns 0 or negative
+#define SYS_DUP2     12   // EBX = oldfd, ECX = newfd; returns newfd or negative
+#define SYS_EXECP    13   // EBX = path, ECX = argv[], EDX = stdout_fd (-1=none), ESI = stdin_fd (-1=none)
+#define SYS_KILL     14   // EBX = tid, ECX = signal (9 = SIGKILL); returns 0 or -ESRCH
+
 #define SYS_EXIT     60
 
 /* ---- open flags ----------------------------------------------------------- */
@@ -143,7 +148,24 @@ static inline int sys_exec(const char* path, const char** argv)
     __asm__ volatile (
         "int $0x80"
         : "=a"(ret)
-        : "a"(SYS_EXEC), "b"(path), "c"(argv)
+        : "a"(SYS_EXEC), "b"(path), "c"(argv), "d"(0)
+        : "memory"
+    );
+    return ret;
+}
+
+// Launch ELF with pipe fd redirection.
+// stdout_fd: caller's fd to wire into child stdout (-1 = no redirect)
+// stdin_fd:  caller's fd to wire into child stdin  (-1 = no redirect)
+// Caller must close its own pipe ends after this returns.
+static inline int sys_execp(const char* path, const char** argv,
+                             int stdout_fd, int stdin_fd)
+{
+    int ret;
+    __asm__ volatile (
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(SYS_EXECP), "b"(path), "c"(argv), "d"(stdout_fd), "S"(stdin_fd)
         : "memory"
     );
     return ret;
@@ -156,6 +178,30 @@ static inline void sys_waitpid(int tid)
         :: "a"(SYS_WAITPID), "b"(tid)
         : "memory"
     );
+}
+
+static inline int sys_pipe(int fds[2])
+{
+    int ret;
+    __asm__ volatile (
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(SYS_PIPE), "c"(fds)
+        : "memory"
+    );
+    return ret;
+}
+
+static inline int sys_dup2(int oldfd, int newfd)
+{
+    int ret;
+    __asm__ volatile (
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(SYS_DUP2), "b"(oldfd), "c"(newfd)
+        : "memory"
+    );
+    return ret;
 }
 
 static inline void sys_exit(int code)

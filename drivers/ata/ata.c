@@ -1,6 +1,7 @@
 #include "ata.h"
 #include "../../kernel/klog.h"
 #include "../../kernel/panic.h"
+#include "../../kernel/irq.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -85,6 +86,38 @@ static void ata_delay(uint8_t channel)
         inb(channel_control[channel] + ATA_REG_ALTSTATUS);
 }
 
+// ---- per-channel IRQ state -------------------------------------------------
+//
+// irq_fired[ch] is set to 1 by the IRQ handler and cleared to 0 before each
+// command is issued.  ata_wait_irq() halts the CPU (hlt) until it becomes 1.
+// Interrupts must be enabled during the wait — the shell kernel task runs with
+// IF=1 except during brief critical sections, so this is always safe.
+//
+// We deliberately keep this as a plain volatile flag rather than using the
+// scheduler sleep/wake mechanism: ATA I/O happens from kernel task context
+// during FAT32 calls, and blocking the task via scheduler_sleep would require
+// pulling in scheduler.h and adding a more complex wakeup path.  The hlt loop
+// is equivalent in practice — the PIT still fires every 1 ms so other tasks
+// continue to be scheduled, and the IRQ wakes us out of hlt on the next tick.
+
+static volatile uint8_t irq_fired[2] = { 0, 0 };
+
+static void ata_irq_primary(regs_t* r)
+{
+    (void)r;
+    // Reading alternate status acknowledges the interrupt on the drive side.
+    // The PIC EOI is sent by irq.c's dispatch wrapper.
+    inb(channel_control[0] + ATA_REG_ALTSTATUS);
+    irq_fired[0] = 1;
+}
+
+static void ata_irq_secondary(regs_t* r)
+{
+    (void)r;
+    inb(channel_control[1] + ATA_REG_ALTSTATUS);
+    irq_fired[1] = 1;
+}
+
 // ---- polling ---------------------------------------------------------------
 
 // Wait until BSY clears.  Returns 0 on success, -1 on timeout or drive fault.
@@ -113,6 +146,23 @@ static int ata_wait_drq(uint8_t channel)
     return -3;  // timeout
 }
 
+// Block until the channel fires its IRQ.  Interrupts must be enabled.
+static void ata_wait_irq_or_poll(uint8_t channel)
+{
+    uint32_t eflags;
+    __asm__ volatile ("pushf; pop %0" : "=r"(eflags));
+
+    if (eflags & (1u << 9)) {
+        // Interrupts enabled — yield via hlt
+        while (!irq_fired[channel])
+            __asm__ volatile ("hlt");
+    } else {
+        // Interrupts disabled — poll BSY until clear
+        ata_wait_not_busy(channel);
+        irq_fired[channel] = 0;  // clear so next IRQ-driven call starts clean
+    }
+}
+
 // ---- drive selection -------------------------------------------------------
 
 static void ata_select_drive(uint8_t channel, uint8_t slave)
@@ -135,6 +185,8 @@ static int ata_identify(uint8_t channel, uint8_t slave, ata_drive_t* drive)
     outb(channel_base[channel] + ATA_REG_LBA_LO,   0);
     outb(channel_base[channel] + ATA_REG_LBA_MID,  0);
     outb(channel_base[channel] + ATA_REG_LBA_HI,   0);
+
+    irq_fired[channel] = 0;
 
     outb(channel_base[channel] + ATA_REG_CMD, ATA_CMD_IDENTIFY);
 
@@ -207,9 +259,13 @@ void ata_init(void)
     for (int i = 0; i < ATA_MAX_DRIVES; i++)
         drives[i].present = 0;
 
-    // Disable IRQs on both channels — we use polling only
-    outb(channel_control[0] + ATA_REG_DEVCTRL, 0x02);  // nIEN bit
+    // Mask IRQs on both channels during IDENTIFY (nIEN = bit 1).
+    outb(channel_control[0] + ATA_REG_DEVCTRL, 0x02);
     outb(channel_control[1] + ATA_REG_DEVCTRL, 0x02);
+
+    // Install IRQ handlers before we unmask.
+    irq_install_handler(14, ata_irq_primary);
+    irq_install_handler(15, ata_irq_secondary);
 
     uint8_t idx = 0;
     for (uint8_t ch = 0; ch < 2; ch++) {
@@ -217,8 +273,7 @@ void ata_init(void)
             int found = ata_identify(ch, sl, &drives[idx]);
             if (found) {
                 klog_info("ATA: drive %u - %s (%s %s, %u sectors = %u MiB)",
-                    idx,
-                    drives[idx].model,
+                    idx, drives[idx].model,
                     ch ? "secondary" : "primary",
                     sl ? "slave" : "master",
                     drives[idx].sector_count,
@@ -231,6 +286,10 @@ void ata_init(void)
             }
         }
     }
+
+    // All IDENTIFY done — now unmask IRQs (clear nIEN).
+    outb(channel_control[0] + ATA_REG_DEVCTRL, 0x00);
+    outb(channel_control[1] + ATA_REG_DEVCTRL, 0x00);
 }
 
 const ata_drive_t* ata_get_drive(uint8_t drive_index)
@@ -250,7 +309,7 @@ int ata_read_sectors(uint8_t drive_index, uint32_t lba,
     if (count == 0)
         return 0;
 
-    ata_drive_t* d = &drives[drive_index];
+    ata_drive_t* d   = &drives[drive_index];
     uint16_t*    dst = (uint16_t*)buf;
 
     if (ata_wait_not_busy(d->channel) != 0) {
@@ -258,23 +317,30 @@ int ata_read_sectors(uint8_t drive_index, uint32_t lba,
         return -1;
     }
 
-    ata_setup_lba28(d->channel, d->slave, lba, count);
-    outb(channel_base[d->channel] + ATA_REG_CMD, ATA_CMD_READ_PIO);
+    for (uint8_t s = 0; s < count; s++, lba++) {
+        // Clear the flag before issuing the command so we cannot miss an IRQ
+        // that fires before we enter ata_wait_irq().
+        irq_fired[d->channel] = 0;
 
-    for (uint8_t s = 0; s < count; s++) {
+        ata_setup_lba28(d->channel, d->slave, lba, 1);
+        outb(channel_base[d->channel] + ATA_REG_CMD, ATA_CMD_READ_PIO);
+
+        // Yield the CPU until the drive raises its IRQ.
         ata_delay(d->channel);
+        ata_wait_irq_or_poll(d->channel);
 
-        if (ata_wait_not_busy(d->channel) != 0) {
-            klog_warn("ATA: read BSY timeout sector %u", s);
+        // Check status after IRQ — clears the interrupt on the host side.
+        uint8_t status = inb(channel_base[d->channel] + ATA_REG_STATUS);
+        if (status & ATA_SR_ERR) {
+            klog_warn("ATA: read error (drive %u, lba %u)", drive_index, lba);
+            return -1;
+        }
+        if (status & ATA_SR_DF) {
+            klog_warn("ATA: drive fault (drive %u, lba %u)", drive_index, lba);
             return -1;
         }
 
-        if (ata_wait_drq(d->channel) != 0) {
-            klog_warn("ATA: read DRQ timeout sector %u", s);
-            return -1;
-        }
-
-        // Read 256 words = 512 bytes = one sector
+        // Transfer one sector (256 words = 512 bytes).
         for (int i = 0; i < 256; i++)
             *dst++ = inw(channel_base[d->channel] + ATA_REG_DATA);
     }
@@ -290,36 +356,49 @@ int ata_write_sectors(uint8_t drive_index, uint32_t lba,
     if (count == 0)
         return 0;
 
-    ata_drive_t*     d   = &drives[drive_index];
-    const uint16_t*  src = (const uint16_t*)buf;
+    ata_drive_t*    d   = &drives[drive_index];
+    const uint16_t* src = (const uint16_t*)buf;
 
     if (ata_wait_not_busy(d->channel) != 0) {
         klog_warn("ATA: write timeout (drive %u, lba %u)", drive_index, lba);
         return -1;
     }
 
-    ata_setup_lba28(d->channel, d->slave, lba, count);
-    outb(channel_base[d->channel] + ATA_REG_CMD, ATA_CMD_WRITE_PIO);
+    for (uint8_t s = 0; s < count; s++, lba++) {
+        irq_fired[d->channel] = 0;
 
-    for (uint8_t s = 0; s < count; s++) {
+        ata_setup_lba28(d->channel, d->slave, lba, 1);
+        outb(channel_base[d->channel] + ATA_REG_CMD, ATA_CMD_WRITE_PIO);
+
+        // For writes the drive raises DRQ immediately (before the IRQ) to
+        // signal it is ready to accept data.  We must poll for DRQ here —
+        // the IRQ fires *after* the data is accepted and written to the cache.
         ata_delay(d->channel);
-
-        if (ata_wait_not_busy(d->channel) != 0) {
-            klog_warn("ATA: write BSY timeout sector %u", s);
-            return -1;
-        }
-
         if (ata_wait_drq(d->channel) != 0) {
-            klog_warn("ATA: write DRQ timeout sector %u", s);
+            klog_warn("ATA: write DRQ timeout (drive %u, lba %u)", drive_index, lba);
             return -1;
         }
 
-        // Write 256 words = 512 bytes = one sector
+        // Transfer one sector.
         for (int i = 0; i < 256; i++)
             outw(channel_base[d->channel] + ATA_REG_DATA, *src++);
+
+        // Now wait for the drive to signal completion via IRQ.
+        ata_delay(d->channel);
+        ata_wait_irq_or_poll(d->channel);
+
+        uint8_t status = inb(channel_base[d->channel] + ATA_REG_STATUS);
+        if (status & ATA_SR_ERR) {
+            klog_warn("ATA: write error (drive %u, lba %u)", drive_index, lba);
+            return -1;
+        }
+        if (status & ATA_SR_DF) {
+            klog_warn("ATA: drive fault (drive %u, lba %u)", drive_index, lba);
+            return -1;
+        }
     }
 
-    // Flush write cache
+    // Flush write cache — no IRQ is generated for FLUSH, poll BSY.
     outb(channel_base[d->channel] + ATA_REG_CMD, ATA_CMD_FLUSH);
     ata_wait_not_busy(d->channel);
 

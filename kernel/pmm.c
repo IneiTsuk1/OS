@@ -14,7 +14,12 @@ static uint32_t bitmap[BITMAP_SIZE];  // 128 KiB in .bss
 static uint32_t total_frames = 0;
 static uint32_t free_frames  = 0;
 
-// Protects bitmap, free_frames during concurrent alloc/free.
+// Next-fit cursor — index into bitmap[] (word index, not frame index).
+// pmm_alloc_frame starts its scan here and wraps around.
+// Avoids rescanning the low kernel/bitmap frames on every allocation.
+static uint32_t next_word = 0;
+
+// Protects bitmap, free_frames, next_word during concurrent alloc/free.
 // pmm_init() runs before interrupts and SMP, so no lock needed there.
 static spinlock_t pmm_lock = SPINLOCK_INIT;
 
@@ -99,6 +104,10 @@ void pmm_init(void)
         }
     }
 
+    // Initialise the next-fit cursor to the first word above the kernel image.
+    // This skips the always-used low frames on every subsequent allocation.
+    next_word = 0;
+
     klog_info("PMM: %d KiB free (%d frames)", (free_frames * PMM_PAGE_SIZE) / 1024, free_frames);
 }
 
@@ -106,23 +115,36 @@ uint32_t pmm_alloc_frame(void)
 {
     spinlock_acquire(&pmm_lock);
 
-    for (uint32_t i = 0; i < BITMAP_SIZE; i++) {
-        if (bitmap[i] == 0xFFFFFFFF)
-            continue;
+    if (free_frames == 0) {
+        spinlock_release(&pmm_lock);
+        return 0;
+    }
 
-        for (uint32_t bit = 0; bit < 32; bit++) {
-            uint32_t frame = i * 32 + bit;
-            if (!bitmap_test(frame)) {
-                bitmap_set(frame);
-                free_frames--;
-                spinlock_release(&pmm_lock);
-                return frame * PMM_PAGE_SIZE;
+    // Two-pass next-fit: start at next_word, wrap around once if needed.
+    for (uint32_t pass = 0; pass < 2; pass++) {
+        uint32_t start = (pass == 0) ? next_word : 0;
+        uint32_t end   = (pass == 0) ? BITMAP_SIZE : next_word;
+
+        for (uint32_t i = start; i < end; i++) {
+            if (bitmap[i] == 0xFFFFFFFF)
+                continue;  // all 32 frames used — skip fast
+
+            for (uint32_t bit = 0; bit < 32; bit++) {
+                uint32_t frame = i * 32 + bit;
+                if (!bitmap_test(frame)) {
+                    bitmap_set(frame);
+                    free_frames--;
+                    next_word = i;  // resume from here next time
+                    spinlock_release(&pmm_lock);
+                    return frame * PMM_PAGE_SIZE;
+                }
             }
         }
     }
 
+    // Should not reach here if free_frames > 0, but handle gracefully.
     spinlock_release(&pmm_lock);
-    return 0;  // out of memory
+    return 0;
 }
 
 void pmm_free_frame(uint32_t addr)
@@ -144,6 +166,12 @@ void pmm_free_frame(uint32_t addr)
 
     bitmap_clear(frame);
     free_frames++;
+
+    // Pull the cursor back if this frame is earlier — lets freed frames
+    // get reused promptly rather than waiting for a full wrap-around.
+    uint32_t freed_word = frame / 32;
+    if (freed_word < next_word)
+        next_word = freed_word;
 
     spinlock_release(&pmm_lock);
 }

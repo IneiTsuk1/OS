@@ -38,6 +38,16 @@ typedef struct task {
     struct task*    waiter;          // task blocked in SYS_WAITPID on this task, or NULL
     struct task*    next;            // intrusive linked list — run queue
 
+    // ---- signals ---------------------------------------------------------
+    // Bitmask of pending signals.  Bit N = signal N (SIGKILL = bit 9).
+    // Set by scheduler_kill(); checked in scheduler_tick().
+    uint32_t        pending_signals;
+
+    // Exit code recorded by scheduler_exit() and returned by SYS_WAITPID.
+    // For normal exits this is the value passed to SYS_EXIT.
+    // For signal-caused exits this is 128 + signal number (POSIX convention).
+    int             exit_code;
+
     // ---- file descriptor table -------------------------------------------
     // fds[i] is NULL (slot closed) or a kmalloc'd vfs_file_t* (slot open).
     // vfs_alloc_fd() allocates the struct; vfs_free_fd() frees it.

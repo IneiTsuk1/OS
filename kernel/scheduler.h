@@ -4,11 +4,12 @@
 
 void     scheduler_init(void);
 void     scheduler_add(task_t* task);
-void     scheduler_exit(void);      // unlink current task, defer free, reschedule
+void     scheduler_exit(int exit_code); // unlink current task, defer free, reschedule
 void     scheduler_tick(void);
 void     scheduler_yield(void);
 void     scheduler_sleep(uint32_t wake_tick);
-void     scheduler_wait(uint32_t tid); // block until task tid exits (or already gone)
+int      scheduler_wait(uint32_t tid); // block until task tid exits; returns exit_code
+int      scheduler_kill(uint32_t tid, int sig); // send signal to task; returns 0 or -ESRCH
 void     scheduler_set_need_reschedule(void); // force reschedule on next IRQ exit
 task_t*  scheduler_current(void);
 

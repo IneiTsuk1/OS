@@ -191,30 +191,63 @@ void scheduler_init(void)
 // wakes any task waiting on this one, and sets need_reschedule so isr_common
 // switches away before iret.
 // Must NOT be called on tid 0 (idle task).
-void scheduler_exit(void)
+void scheduler_exit(int exit_code)
 {
     if (current->tid == 0)
         panic("scheduler_exit: idle task called exit");
 
-    current->state = TASK_DEAD;
+    current->exit_code = exit_code;
+    current->state     = TASK_DEAD;
     dequeue(current);           // unlink; sets current->next = NULL
                                 // run_queue_head advanced off current by dequeue()
 
     // Wake any task blocked in scheduler_wait() on this tid.
+    // Stash our exit code into the waiter's exit_code field so it can be
+    // read by scheduler_wait() after waking (before we are reaped).
     if (current->waiter) {
-        current->waiter->state = TASK_READY;
-        current->waiter        = NULL;
+        current->waiter->exit_code = exit_code;
+        current->waiter->state     = TASK_READY;
+        current->waiter            = NULL;
     }
 
     reap_enqueue(current);      // defer task_free to scheduler_tick (safe stack)
     need_reschedule = 1;        // isr_common will call scheduler_switch_from_irq
 }
 
-// Block the current task until the task with `tid` exits.
-// If no task with that tid is found in the run queue (already exited and reaped),
-// returns immediately — the wait is a no-op.
+// Send signal `sig` to the task with `tid`.
+// Sets the corresponding bit in pending_signals.
+// If the target is TASK_BLOCKED (sleeping/waiting), wakes it so it can be
+// killed promptly on the next scheduler_tick() rather than waiting for its
+// sleep to expire.
+// Returns 0 on success, -1 if no task with that tid exists.
+// Must be called with interrupts disabled (called from syscall context).
+int scheduler_kill(uint32_t tid, int sig)
+{
+    if (sig < 0 || sig > 31)
+        return -1;
+
+    task_t* t = run_queue_head;
+    for (uint32_t i = 0; i < queue_len; i++) {
+        if (t->tid == tid) {
+            t->pending_signals |= (1u << sig);
+            // Wake blocked tasks so they are scheduled and the signal is
+            // delivered promptly in scheduler_tick().
+            if (t->state == TASK_BLOCKED) {
+                t->state     = TASK_READY;
+                t->wake_tick = 0;
+                need_reschedule = 1;
+            }
+            return 0;
+        }
+        t = t->next;
+    }
+    return -1;  // ESRCH
+}
+
+
+// Returns the child's exit_code (or 0 if the task was already gone).
 // Must be called with interrupts enabled (we hlt while blocked).
-void scheduler_wait(uint32_t tid)
+int scheduler_wait(uint32_t tid)
 {
     uint32_t flags = eflags_read();
     __asm__ volatile ("cli");
@@ -236,7 +269,7 @@ void scheduler_wait(uint32_t tid)
         // Already gone — nothing to wait for.
         if (flags & (1u << 9))
             __asm__ volatile ("sti");
-        return;
+        return 0;
     }
 
     // Register current as the waiter and block.
@@ -250,6 +283,19 @@ void scheduler_wait(uint32_t tid)
     // Spin-wait with hlt — scheduler_exit() will set us TASK_READY.
     while (current->state == TASK_BLOCKED)
         __asm__ volatile ("hlt");
+
+    // target has been reaped by now; its exit_code was saved before it
+    // was enqueued for freeing.  We stashed it in current before being woken.
+    // Because the waiter pointer is cleared before wake, we use a local.
+    // Actually: we need to read it before reap_drain frees target.
+    // scheduler_exit() wakes us synchronously, and reap_drain only runs on
+    // the next tick — so target is still valid here for one brief window.
+    // We avoid the race by reading the exit code in scheduler_exit() itself
+    // via the waiter's exit_code field set there.  Instead we use a simpler
+    // approach: stash the child exit code into current->exit_code temporarily.
+    int code = current->exit_code; // set by scheduler_exit before waking us
+    current->exit_code = 0;        // restore for our own future exit
+    return code;
 }
 
 void scheduler_add(task_t* task)
@@ -313,6 +359,20 @@ void scheduler_tick(void)
             t->wake_tick = 0;
         }
         t = t->next;
+    }
+
+    // --- signal delivery ----------------------------------------------------
+    // Check current task for SIGKILL (bit 9).  Only current runs here, so we
+    // only need to kill ourselves; other tasks' signals are delivered when they
+    // next become current (next tick after being woken by scheduler_kill).
+    // Idle task (tid 0) cannot be killed.
+    if (current->tid != 0 &&
+        (current->pending_signals & (1u << 9))) {
+        current->pending_signals &= ~(1u << 9);
+        klog_warn("scheduler: SIGKILL delivered to tid=%u", current->tid);
+        // exit_code = 128 + 9 = 137 (POSIX convention)
+        scheduler_exit(128 + 9);
+        // scheduler_exit sets need_reschedule; fall through to preemption check.
     }
 
     // --- time-slice preemption ----------------------------------------------

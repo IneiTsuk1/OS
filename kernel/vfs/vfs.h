@@ -110,6 +110,16 @@ typedef struct vfs_ops {
     // Create a regular file at `path`.  Fails with VFS_EEXIST if it exists.
     int (*create)(const char* path);
 
+    // Rename / move `src` to `dst`.
+    // - If `dst` names an existing file, it is replaced atomically.
+    // - If `dst` names an existing empty directory and `src` is a directory,
+    //   `dst` is removed and `src` takes its place.
+    // - Fails with VFS_EISDIR  if `dst` is a directory but `src` is not.
+    // - Fails with VFS_ENOTDIR if `src` is a directory but `dst` is a file.
+    // - Fails with VFS_EGENERIC if `dst` is a non-empty directory.
+    // Both paths must be on the same volume (cross-device rename unsupported).
+    int (*rename)(const char* src, const char* dst);
+
 } vfs_ops_t;
 
 // ---- public VFS API --------------------------------------------------------
@@ -153,12 +163,20 @@ int vfs_mkdir(const char* path);
 int vfs_rmdir(const char* path);
 int vfs_create(const char* path);
 int vfs_unlink(const char* path);
+int vfs_rename(const char* src, const char* dst);
 
 // ---- fd table helpers (used by task.c / scheduler.c) ----------------------
 
 // Allocate a vfs_file_t from the current task's fd table.
 // Returns the fd index, or negative if the table is full.
 int vfs_alloc_fd(vfs_file_t** out);
+
+// Insert an already-allocated vfs_file_t* into an explicit task's fd table.
+// Finds the first free slot (>= 3) and stores `file` there.
+// Returns the fd index on success, or VFS_EBADF if the table is full.
+// Does NOT allocate or initialise the file — caller owns that.
+// Used by SYS_PIPE to place pre-built pipe file structs into a task's table.
+int vfs_alloc_fd_for(task_t* task, vfs_file_t* file);
 
 // Populate fds 0/1/2 of `task` with terminal pseudo-files (stdin/stdout/stderr).
 // Called from task_create() and task_create_user() after the task struct is ready.
